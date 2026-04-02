@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard | AtlasAuth{% endblock %}
+
+{% block content %}
+<section class="dashboard">
+    <div class="dashboard-card">
+        <span class="eyebrow">Protected Area</span>
+        <h1>Hello, {{ current_user_name }}.</h1>
+        <p>Your login session is active and your user record is being stored in MongoDB.</p>
+        <form action="{{ url_for('logout') }}" method="post">
+            <button type="submit" class="button button-primary">Logout</button>
+        </form>
+    </div>
+</section>
+{% endblock %}

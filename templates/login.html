@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+
+{% block title %}Login | AtlasAuth{% endblock %}
+
+{% block content %}
+<section class="auth-shell">
+    <div class="auth-card">
+        <h1>Welcome back</h1>
+        <p>Sign in to continue to your dashboard.</p>
+        <form method="post" class="auth-form">
+            <label for="email">Email</label>
+            <input id="email" name="email" type="email" placeholder="you@example.com" required>
+
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" placeholder="Enter your password" required>
+
+            <button type="submit" class="button button-primary button-block">Login</button>
+        </form>
+        <p class="auth-link">New here? <a href="{{ url_for('register') }}">Create an account</a></p>
+    </div>
+</section>
+{% endblock %}

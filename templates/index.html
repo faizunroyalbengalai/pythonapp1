@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block title %}Welcome | AtlasAuth{% endblock %}
+
+{% block content %}
+<section class="hero">
+    <div class="hero-copy">
+        <span class="eyebrow">MongoDB Atlas Ready</span>
+        <h1>Launch a clean auth flow with your own cloud database.</h1>
+        <p>
+            This starter app gives you a polished landing page, registration, login,
+            session handling, and a protected dashboard backed by MongoDB.
+        </p>
+        <div class="hero-actions">
+            <a href="{{ url_for('register') }}" class="button button-primary">Create Account</a>
+            <a href="{{ url_for('login') }}" class="button button-secondary">Sign In</a>
+        </div>
+    </div>
+    <div class="hero-card">
+        <div class="stat">
+            <span class="stat-label">Features</span>
+            <strong>Landing + Auth</strong>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Database</span>
+            <strong>MongoDB Atlas</strong>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Stack</span>
+            <strong>Flask + PyMongo</strong>
+        </div>
+    </div>
+</section>
+{% endblock %}
