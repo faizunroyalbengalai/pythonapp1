@@ -1,0 +1,381 @@
+---
+- name: Deploy python app
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_port: 8000
+    app_user: ubuntu
+    app_name: pythonappr
+    database_url: ""
+    mongo_uri: ""
+    db_host: ""
+    db_port: ""
+    db_name: ""
+    db_user: ""
+    db_password: ""
+    install_db: ""
+    db_type: ""
+    db_username: ""
+    db_password_plain: ""
+
+  handlers:
+    - name: reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: restart app
+      systemd:
+        name: pythonappr
+        state: restarted
+        daemon_reload: yes
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - nginx
+          - git
+          - curl
+          - build-essential
+        state: present
+
+    - name: Install PostgreSQL if requested
+      block:
+        - name: Install PostgreSQL packages
+          apt:
+            name:
+              - postgresql
+              - postgresql-contrib
+              - libpq-dev
+            state: present
+
+        - name: Ensure PostgreSQL is started and enabled
+          service:
+            name: postgresql
+            state: started
+            enabled: yes
+
+        - name: Create PostgreSQL database
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+          when: db_name | length > 0
+
+        - name: Create PostgreSQL user
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password_plain }}';"
+          when: db_username | length > 0 and db_password_plain | length > 0
+
+        - name: Grant privileges to PostgreSQL user
+          shell: |
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+          when: db_name | length > 0 and db_username | length > 0
+      when: install_db | string | lower == 'true' and db_type | lower == 'postgres'
+
+    - name: Install MySQL if requested
+      block:
+        - name: Install MySQL packages
+          apt:
+            name:
+              - mysql-server
+              - mysql-client
+              - libmysqlclient-dev
+              - python3-mysqldb
+            state: present
+
+        - name: Ensure MySQL is started and enabled
+          service:
+            name: mysql
+            state: started
+            enabled: yes
+
+        - name: Create MySQL database
+          shell: |
+            mysql -u root -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+          when: db_name | length > 0
+
+        - name: Create MySQL user
+          shell: |
+            mysql -u root -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password_plain }}';"
+            mysql -u root -e "GRANT ALL PRIVILEGES ON {{ db_name }}.* TO '{{ db_username }}'@'localhost';"
+            mysql -u root -e "FLUSH PRIVILEGES;"
+          when: db_username | length > 0 and db_name | length > 0
+      when: install_db | string | lower == 'true' and db_type | lower == 'mysql'
+
+    - name: Install MongoDB if requested
+      block:
+        - name: Import MongoDB GPG key
+          shell: |
+            curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+          args:
+            creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+
+        - name: Add MongoDB repository
+          copy:
+            content: |
+              deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse
+            dest: /etc/apt/sources.list.d/mongodb-org-7.0.list
+
+        - name: Update apt cache for MongoDB
+          apt:
+            update_cache: yes
+
+        - name: Install MongoDB
+          apt:
+            name: mongodb-org
+            state: present
+
+        - name: Ensure MongoDB is started and enabled
+          service:
+            name: mongod
+            state: started
+            enabled: yes
+      when: install_db | string | lower == 'true' and db_type | lower == 'mongodb'
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Clone or pull app from GitHub
+      git:
+        repo: "https://github.com/{{ lookup('env', 'GITHUB_REPOSITORY') }}.git"
+        dest: "{{ app_dir }}"
+        version: HEAD
+        force: yes
+      environment:
+        GIT_TERMINAL_PROMPT: "0"
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Check if requirements.txt exists
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: req_stat
+
+    - name: Write default requirements.txt if missing
+      copy:
+        content: |
+          fastapi
+          uvicorn[standard]
+          gunicorn
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+      when: not req_stat.stat.exists
+
+    - name: Check if main.py exists
+      stat:
+        path: "{{ app_dir }}/main.py"
+      register: main_stat
+
+    - name: Write default main.py if missing
+      copy:
+        content: |
+          from fastapi import FastAPI
+          from fastapi.responses import HTMLResponse
+          import os
+
+          app = FastAPI()
+
+          @app.get("/", response_class=HTMLResponse)
+          def root():
+              index_path = os.path.join(os.path.dirname(__file__), "index.html")
+              if os.path.exists(index_path):
+                  with open(index_path, "r") as f:
+                      return HTMLResponse(content=f.read())
+              return HTMLResponse(content="<h1>pythonappr</h1><p>Deployed with Ansible</p>")
+
+          @app.get("/health")
+          def health():
+              return {"status": "ok"}
+        dest: "{{ app_dir }}/main.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+      when: not main_stat.stat.exists
+
+    - name: Build .env content
+      set_fact:
+        env_lines: |
+          APP_NAME={{ app_name }}
+          APP_PORT={{ app_port }}
+
+    - name: Append DATABASE_URL to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}DATABASE_URL={{ database_url }}\n"
+      when: database_url | length > 0
+
+    - name: Append MONGO_URI to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}MONGO_URI={{ mongo_uri }}\n"
+      when: mongo_uri | length > 0
+
+    - name: Append DB_HOST to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}DB_HOST={{ db_host }}\n"
+      when: db_host | length > 0
+
+    - name: Append DB_PORT to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}DB_PORT={{ db_port }}\n"
+      when: db_port | length > 0
+
+    - name: Append DB_NAME to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}DB_NAME={{ db_name }}\n"
+      when: db_name | length > 0
+
+    - name: Append DB_USER to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}DB_USER={{ db_user }}\n"
+      when: db_user | length > 0
+
+    - name: Append DB_PASSWORD to env if set
+      set_fact:
+        env_lines: "{{ env_lines }}DB_PASSWORD={{ db_password }}\n"
+      when: db_password | length > 0
+
+    - name: Write .env file
+      copy:
+        content: "{{ env_lines }}"
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+
+    - name: Create Python virtualenv
+      shell: python3 -m venv {{ app_dir }}/venv
+      args:
+        creates: "{{ app_dir }}/venv/bin/activate"
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Install Python requirements
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: python3 -m venv
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Set ownership of app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: Create systemd service for pythonappr
+      copy:
+        content: |
+          [Unit]
+          Description=pythonappr Python App
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ app_dir }}/venv/bin/gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:{{ app_port }} main:app
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/pythonappr.service
+        mode: '0644'
+      notify: restart app
+
+    - name: Enable and start pythonappr service
+      systemd:
+        name: pythonappr
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Configure nginx for pythonappr
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_read_timeout 60s;
+              }
+          }
+        dest: /etc/nginx/sites-enabled/pythonappr
+        mode: '0644'
+      notify: reload nginx
+
+    - name: Ensure nginx is started and enabled
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Force all notified handlers to run now
+      meta: flush_handlers
+
+    - name: Wait for app to be available on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 120
+        delay: 10
+      register: wait_result
+      ignore_errors: yes
+
+    - name: Show journalctl logs on failure
+      shell: journalctl -u pythonappr --no-pager -n 50
+      when: wait_result is failed
+      register: journal_output
+
+    - name: Print journal logs on failure
+      debug:
+        msg: "{{ journal_output.stdout_lines }}"
+      when: wait_result is failed
+
+    - name: Fail if app did not start
+      fail:
+        msg: "pythonappr failed to start on port 8000. Check journalctl logs above."
+      when: wait_result is failed
+
+    - name: Print deployment success
+      debug:
+        msg: "server_ip={{ ansible_host }}"
