@@ -1,0 +1,327 @@
+---
+- name: Deploy python app on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_port: 8000
+    app_user: ubuntu
+    app_name: pythonapp
+    python_bin: /usr/bin/python3
+
+  handlers:
+    - name: restart app
+      systemd:
+        name: app
+        state: restarted
+        daemon_reload: yes
+
+    - name: reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - nginx
+          - git
+          - curl
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Clone or pull app from GitHub
+      git:
+        repo: "https://github.com/{{ lookup('env', 'GITHUB_REPOSITORY') }}.git"
+        dest: "{{ app_dir }}"
+        version: HEAD
+        force: yes
+      become: yes
+      become_user: "{{ app_user }}"
+      environment:
+        GIT_TERMINAL_PROMPT: "0"
+
+    - name: Check if requirements.txt exists
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: req_stat
+
+    - name: Write default requirements.txt if missing
+      copy:
+        content: |
+          fastapi
+          uvicorn[standard]
+          gunicorn
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      when: not req_stat.stat.exists
+
+    - name: Check if main.py exists
+      stat:
+        path: "{{ app_dir }}/main.py"
+      register: main_py_stat
+
+    - name: Write default main.py if missing
+      copy:
+        content: |
+          from fastapi import FastAPI
+          from fastapi.responses import HTMLResponse
+          import os
+
+          app = FastAPI()
+
+          @app.get("/", response_class=HTMLResponse)
+          def root():
+              index_path = os.path.join(os.path.dirname(__file__), "index.html")
+              if os.path.exists(index_path):
+                  with open(index_path) as f:
+                      return HTMLResponse(content=f.read())
+              return HTMLResponse(content="<h1>pythonapp</h1><p>Deployed with Ansible</p>")
+
+          @app.get("/health")
+          def health():
+              return {"status": "ok"}
+        dest: "{{ app_dir }}/main.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      when: not main_py_stat.stat.exists
+
+    - name: Create virtualenv
+      shell: python3 -m venv {{ app_dir }}/venv
+      args:
+        creates: "{{ app_dir }}/venv/bin/activate"
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Install Python requirements
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: python3 -m venv
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Build .env content
+      set_fact:
+        env_lines: |
+          {% if database_url is defined and database_url != '' %}DATABASE_URL={{ database_url }}
+          {% endif %}
+          {% if mongo_uri is defined and mongo_uri != '' %}MONGO_URI={{ mongo_uri }}
+          {% endif %}
+          {% if db_host is defined and db_host != '' %}DB_HOST={{ db_host }}
+          {% endif %}
+          {% if db_port is defined and db_port != '' %}DB_PORT={{ db_port }}
+          {% endif %}
+          {% if db_name is defined and db_name != '' %}DB_NAME={{ db_name }}
+          {% endif %}
+          {% if db_user is defined and db_user != '' %}DB_USER={{ db_user }}
+          {% endif %}
+          {% if db_username is defined and db_username != '' %}DB_USERNAME={{ db_username }}
+          {% endif %}
+          {% if db_password is defined and db_password != '' %}DB_PASSWORD={{ db_password }}
+          {% endif %}
+
+    - name: Write .env file
+      copy:
+        content: "{{ env_lines }}"
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+
+    - name: Install local database if requested
+      block:
+        - name: Install PostgreSQL
+          apt:
+            name:
+              - postgresql
+              - postgresql-contrib
+              - python3-psycopg2
+            state: present
+          when: db_type is defined and db_type in ['postgres', 'postgresql']
+
+        - name: Start PostgreSQL
+          service:
+            name: postgresql
+            state: started
+            enabled: yes
+          when: db_type is defined and db_type in ['postgres', 'postgresql']
+
+        - name: Create PostgreSQL user
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username | default(db_user) }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE USER {{ db_username | default(db_user) }} WITH PASSWORD '{{ db_password }}';"
+          when:
+            - db_type is defined and db_type in ['postgres', 'postgresql']
+            - (db_username is defined and db_username != '') or (db_user is defined and db_user != '')
+            - db_password is defined and db_password != ''
+
+        - name: Create PostgreSQL database
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE DATABASE {{ db_name }} OWNER {{ db_username | default(db_user) }};"
+          when:
+            - db_type is defined and db_type in ['postgres', 'postgresql']
+            - db_name is defined and db_name != ''
+
+        - name: Install MySQL
+          apt:
+            name:
+              - mysql-server
+              - python3-mysqldb
+            state: present
+          when: db_type is defined and db_type in ['mysql']
+
+        - name: Start MySQL
+          service:
+            name: mysql
+            state: started
+            enabled: yes
+          when: db_type is defined and db_type in ['mysql']
+
+        - name: Create MySQL database and user
+          shell: |
+            mysql -u root -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+            mysql -u root -e "CREATE USER IF NOT EXISTS '{{ db_username | default(db_user) }}'@'localhost' IDENTIFIED BY '{{ db_password }}';"
+            mysql -u root -e "GRANT ALL PRIVILEGES ON {{ db_name }}.* TO '{{ db_username | default(db_user) }}'@'localhost'; FLUSH PRIVILEGES;"
+          when:
+            - db_type is defined and db_type in ['mysql']
+            - db_name is defined and db_name != ''
+
+        - name: Install MongoDB
+          block:
+            - name: Add MongoDB apt key
+              apt_key:
+                url: https://www.mongodb.org/static/pgp/server-7.0.asc
+                state: present
+
+            - name: Add MongoDB repo
+              apt_repository:
+                repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+                state: present
+
+            - name: Install mongodb-org
+              apt:
+                name: mongodb-org
+                state: present
+                update_cache: yes
+
+            - name: Start MongoDB
+              service:
+                name: mongod
+                state: started
+                enabled: yes
+          when: db_type is defined and db_type in ['mongodb', 'mongo']
+
+      when: install_db is defined and install_db | string | lower in ['true', '1', 'yes']
+
+    - name: Write systemd service for app
+      copy:
+        content: |
+          [Unit]
+          Description=pythonapp Python App
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ app_dir }}/venv/bin/gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:{{ app_port }} main:app
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/app.service
+        mode: "0644"
+      notify: restart app
+
+    - name: Enable and start app service
+      systemd:
+        name: app
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Write nginx site config
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 60s;
+              }
+          }
+        dest: /etc/nginx/sites-enabled/app
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Ensure nginx is started and enabled
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Force all notified handlers to run now
+      meta: flush_handlers
+
+    - name: Wait for app to be ready on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 120
+        delay: 10
+      register: app_wait
+      ignore_errors: yes
+
+    - name: Show journalctl output if app did not start
+      shell: journalctl -u app --no-pager -n 50
+      register: journal_out
+      when: app_wait is failed
+
+    - name: Print journal output
+      debug:
+        msg: "{{ journal_out.stdout_lines }}"
+      when: app_wait is failed
+
+    - name: Fail if app did not become ready
+      fail:
+        msg: "App did not start on port {{ app_port }} within timeout"
+      when: app_wait is failed
+
+    - name: Print server IP on success
+      debug:
+        msg: "server_ip={{ ansible_host }}"
