@@ -185,6 +185,11 @@
         path: "{{ app_dir }}/main.py"
       register: main_stat
 
+    - name: Check if app.py exists
+      stat:
+        path: "{{ app_dir }}/app.py"
+      register: app_stat
+
     - name: Write default main.py if missing
       copy:
         content: |
@@ -209,7 +214,7 @@
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         mode: '0644'
-      when: not main_stat.stat.exists
+      when: not main_stat.stat.exists and not app_stat.stat.exists
 
     - name: Build .env content
       set_fact:
@@ -275,6 +280,20 @@
       become: yes
       become_user: "{{ app_user }}"
 
+    - name: Install werkzeug and flask dependencies if app.py is Flask
+      pip:
+        name:
+          - flask
+          - pymongo
+          - python-dotenv
+          - werkzeug
+          - gunicorn
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: python3 -m venv
+      become: yes
+      become_user: "{{ app_user }}"
+      when: app_stat.stat.exists
+
     - name: Set ownership of app directory
       file:
         path: "{{ app_dir }}"
@@ -282,6 +301,10 @@
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         recurse: yes
+
+    - name: Detect entrypoint module
+      set_fact:
+        entrypoint_module: "{{ 'app:app' if app_stat.stat.exists else 'main:app' }}"
 
     - name: Create systemd service for pythonappr
       copy:
@@ -294,7 +317,7 @@
           User={{ app_user }}
           WorkingDirectory={{ app_dir }}
           EnvironmentFile={{ app_dir }}/.env
-          ExecStart={{ app_dir }}/venv/bin/gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:{{ app_port }} main:app
+          ExecStart={{ app_dir }}/venv/bin/gunicorn -w 2 -b 0.0.0.0:{{ app_port }} {{ entrypoint_module }}
           Restart=on-failure
           RestartSec=5
           StandardOutput=journal
